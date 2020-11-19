@@ -136,11 +136,7 @@ static PSI_cond_info all_conn_manager_conds[]=
 
 bool Connection_handler_manager::init()
 {
-  /*
-    This is a static member function.
-    Per_thread_connection_handler's static members need to be initialized
-    even if One_thread_connection_handler is used instead.
-  */
+  // This is a static member function.
   Per_thread_connection_handler::init();
 
   Connection_handler *connection_handler= NULL;
@@ -151,6 +147,9 @@ bool Connection_handler_manager::init()
     break;
   case SCHEDULER_NO_THREADS:
     connection_handler= new (std::nothrow) One_thread_connection_handler();
+    break;
+  case SCHEDULER_THREAD_POOL:
+    connection_handler= new (std::nothrow) Thread_pool_connection_handler();
     break;
   default:
     DBUG_ASSERT(false);

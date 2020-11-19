@@ -420,7 +420,7 @@ bool Foreign_key::validate(List<Create_field> &table_fields)
 */
 void *thd_get_scheduler_data(THD *thd)
 {
-  return thd->scheduler.data;
+  return thd->event_scheduler.data;
 }
 
 /**
@@ -431,7 +431,7 @@ void *thd_get_scheduler_data(THD *thd)
 */
 void thd_set_scheduler_data(THD *thd, void *data)
 {
-  thd->scheduler.data= data;
+  thd->event_scheduler.data= data;
 }
 
 PSI_thread* THD::get_psi()
@@ -1133,6 +1133,11 @@ THD::THD(bool enable_plugins)
   thread_stack= 0;
   m_catalog.str= "std";
   m_catalog.length= 3;
+  // per-thread and one-thread scheduler callbacks are no-ops, so NULL works
+  // for them, threadpool scheduler will change this for its THDs.
+  scheduler= NULL;
+  event_scheduler.data= 0;
+  skip_wait_timeout= false;
   m_security_ctx= &m_main_security_ctx;
   no_errors= 0;
   password= 0;

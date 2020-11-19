@@ -64,10 +64,13 @@
 #ifdef _WIN32
 #include "named_pipe.h"
 #endif
+#include "threadpool.h"
 
 #ifdef WITH_PERFSCHEMA_STORAGE_ENGINE
 #include "../storage/perfschema/pfs_server.h"
 #endif /* WITH_PERFSCHEMA_STORAGE_ENGINE */
+
+#define MAX_CONNECTIONS 100000
 
 TYPELIB bool_typelib={ array_elements(bool_values)-1, "", bool_values, 0 };
 
@@ -538,7 +541,7 @@ static Sys_var_long Sys_pfs_events_stages_history_size(
   - 1 for "statement/com/Error", for invalid enum_server_command
   - SQLCOM_END for all regular "statement/sql/...",
   - 1 for "statement/sql/error", for invalid enum_sql_command.
-  - SP_PSI_STATEMENT_INFO_COUNT for "statement/sp/...". 
+  - SP_PSI_STATEMENT_INFO_COUNT for "statement/sp/...".
   - 1 for "statement/rpl/relay_log", for replicated statements.
   - 1 for "statement/scheduler/event", for scheduled events.
 */
@@ -981,7 +984,7 @@ static Sys_var_enum rbr_exec_mode(
 
 static const char *binlog_row_image_names[]= {"MINIMAL", "NOBLOB", "FULL", NullS};
 static Sys_var_enum Sys_binlog_row_image(
-       "binlog_row_image", 
+       "binlog_row_image",
        "Controls whether rows should be logged in 'FULL', 'NOBLOB' or "
        "'MINIMAL' formats. 'FULL', means that all columns in the before "
        "and after image are logged. 'NOBLOB', means that mysqld avoids logging "
@@ -1808,7 +1811,7 @@ static Sys_var_mybool Sys_large_pages(
 
 static Sys_var_charptr Sys_language(
        "lc_messages_dir", "Directory where error messages are",
-       READ_ONLY GLOBAL_VAR(lc_messages_dir_ptr), 
+       READ_ONLY GLOBAL_VAR(lc_messages_dir_ptr),
        CMD_LINE(REQUIRED_ARG, OPT_LC_MESSAGES_DIRECTORY),
        IN_FS_CHARSET, DEFAULT(0));
 
@@ -2323,7 +2326,7 @@ static Sys_var_ulong Sys_max_binlog_size(
 static Sys_var_ulong Sys_max_connections(
        "max_connections", "The number of simultaneous clients allowed",
        GLOBAL_VAR(max_connections), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(1, 100000),
+       VALID_RANGE(1, MAX_CONNECTIONS),
        DEFAULT(MAX_CONNECTIONS_DEFAULT),
        BLOCK_SIZE(1),
        NO_MUTEX_GUARD,
@@ -2578,7 +2581,7 @@ static Sys_var_charptr Sys_named_pipe_full_access_group(
 #endif /* _WIN32 */
 
 
-static bool 
+static bool
 check_net_buffer_length(sys_var *self, THD *thd,  set_var *var)
 {
   longlong val;
@@ -3334,13 +3337,27 @@ static Sys_var_ulong Sys_trans_prealloc_size(
 #ifndef EMBEDDED_LIBRARY
 static const char *thread_handling_names[]=
 {
-  "one-thread-per-connection", "no-threads", "loaded-dynamically",
+  "one-thread-per-connection", "no-threads",
+#ifdef HAVE_POOL_OF_THREADS
+  "pool-of-threads",
+#endif
   0
 };
+
+#if defined (_WIN32) && defined (HAVE_POOL_OF_THREADS)
+/* Windows is using OS threadpool, so we're pretty sure it works well */
+#define DEFAULT_THREAD_HANDLING 2
+#else
+#define DEFAULT_THREAD_HANDLING 0
+#endif
+
 static Sys_var_enum Sys_thread_handling(
        "thread_handling",
        "Define threads usage for handling queries, one of "
-       "one-thread-per-connection, no-threads, loaded-dynamically"
+       "one-thread-per-connection, no-threads"
+#ifdef HAVE_POOL_OF_THREADS
+       ", pool-of-threads"
+#endif
        , READ_ONLY GLOBAL_VAR(Connection_handler_manager::thread_handling),
        CMD_LINE(REQUIRED_ARG), thread_handling_names, DEFAULT(0));
 #endif // !EMBEDDED_LIBRARY
@@ -3510,7 +3527,7 @@ static Sys_var_set Slave_type_conversions(
        " ALL_LOSSY to enable lossy conversions,"
        " ALL_NON_LOSSY to enable non-lossy conversions,"
        " ALL_UNSIGNED to treat all integer column type data to be unsigned values, and"
-       " ALL_SIGNED to treat all integer column type data to be signed values." 
+       " ALL_SIGNED to treat all integer column type data to be signed values."
        " Default treatment is ALL_SIGNED. If ALL_SIGNED and ALL_UNSIGNED both are"
        " specified, ALL_SIGNED will take higher priority than ALL_UNSIGNED."
        " If the variable is assigned the empty set, no conversions are"
@@ -3572,7 +3589,7 @@ static bool check_slave_stopped(sys_var *self, THD *thd, set_var *var)
 
 static const char *slave_rows_search_algorithms_names[]= {"TABLE_SCAN", "INDEX_SCAN", "HASH_SCAN", 0};
 static Sys_var_set Slave_rows_search_algorithms(
-       "slave_rows_search_algorithms", 
+       "slave_rows_search_algorithms",
        "Set of searching algorithms that the slave will use while "
        "searching for records from the storage engine to either "
        "updated or deleted them. Possible values are: INDEX_SCAN, "
@@ -3686,7 +3703,7 @@ bool Sys_var_enum_binlog_checksum::global_update(THD *thd, set_var *var)
   DBUG_ASSERT(mysql_bin_log.checksum_alg_reset ==
               binary_log::BINLOG_CHECKSUM_ALG_UNDEF);
   mysql_mutex_unlock(mysql_bin_log.get_log_lock());
-  
+
   if (check_purge)
     mysql_bin_log.purge();
 
@@ -4069,6 +4086,127 @@ static Sys_var_ulong Sys_thread_cache_size(
        VALID_RANGE(0, 16384), DEFAULT(0), BLOCK_SIZE(1));
 #endif // !EMBEDDED_LIBRARY
 
+#ifdef HAVE_POOL_OF_THREADS
+
+static bool fix_tp_max_threads(sys_var *, THD *, enum_var_type)
+{
+#ifdef _WIN32
+  tp_set_max_threads(threadpool_max_threads);
+#endif
+  return false;
+}
+
+
+#ifdef _WIN32
+static bool fix_tp_min_threads(sys_var *, THD *, enum_var_type)
+{
+  tp_set_min_threads(threadpool_min_threads);
+  return false;
+}
+#endif
+
+
+#ifndef  _WIN32
+static bool fix_threadpool_size(sys_var*, THD*, enum_var_type)
+{
+  tp_set_threadpool_size(threadpool_size);
+  return false;
+}
+
+
+static bool fix_threadpool_stall_limit(sys_var*, THD*, enum_var_type)
+{
+  tp_set_threadpool_stall_limit(threadpool_stall_limit);
+  return false;
+}
+#endif
+
+static inline int my_getncpus()
+{
+#ifdef _SC_NPROCESSORS_ONLN
+  return sysconf(_SC_NPROCESSORS_ONLN);
+#else
+  return 2; /* The value returned by the old my_getncpus implementation */
+#endif
+}
+
+#ifdef _WIN32
+static Sys_var_uint Sys_threadpool_min_threads(
+  "thread_pool_min_threads",
+  "Minimum number of threads in the thread pool.",
+  GLOBAL_VAR(threadpool_min_threads), CMD_LINE(REQUIRED_ARG),
+  VALID_RANGE(1, 256), DEFAULT(1), BLOCK_SIZE(1),
+  NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+  ON_UPDATE(fix_tp_min_threads)
+  );
+#else
+static Sys_var_uint Sys_threadpool_idle_thread_timeout(
+  "thread_pool_idle_timeout",
+  "Timeout in seconds for an idle thread in the thread pool."
+  "Worker thread will be shut down after timeout",
+  GLOBAL_VAR(threadpool_idle_timeout), CMD_LINE(REQUIRED_ARG),
+  VALID_RANGE(1, UINT_MAX), DEFAULT(60), BLOCK_SIZE(1)
+);
+static Sys_var_uint Sys_threadpool_oversubscribe(
+  "thread_pool_oversubscribe",
+  "How many additional active worker threads in a group are allowed.",
+  GLOBAL_VAR(threadpool_oversubscribe), CMD_LINE(REQUIRED_ARG),
+  VALID_RANGE(1, 1000), DEFAULT(3), BLOCK_SIZE(1)
+);
+static Sys_var_uint Sys_threadpool_size(
+ "thread_pool_size",
+ "Number of thread groups in the pool. "
+ "This parameter is roughly equivalent to maximum number of concurrently "
+ "executing threads (threads in a waiting state do not count as executing).",
+  GLOBAL_VAR(threadpool_size), CMD_LINE(REQUIRED_ARG),
+  VALID_RANGE(1, MAX_THREAD_GROUPS), DEFAULT(my_getncpus()), BLOCK_SIZE(1),
+  NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+  ON_UPDATE(fix_threadpool_size)
+);
+static Sys_var_uint Sys_threadpool_stall_limit(
+ "thread_pool_stall_limit",
+ "Maximum query execution time in milliseconds,"
+ "before an executing non-yielding thread is considered stalled."
+ "If a worker thread is stalled, additional worker thread "
+ "may be created to handle remaining clients.",
+  GLOBAL_VAR(threadpool_stall_limit), CMD_LINE(REQUIRED_ARG),
+  VALID_RANGE(10, UINT_MAX), DEFAULT(500), BLOCK_SIZE(1),
+  NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+  ON_UPDATE(fix_threadpool_stall_limit)
+);
+static Sys_var_uint Sys_threadpool_high_prio_tickets(
+  "thread_pool_high_prio_tickets",
+  "Number of tickets to enter the high priority event queue for each "
+  "transaction.",
+  SESSION_VAR(threadpool_high_prio_tickets), CMD_LINE(REQUIRED_ARG),
+  VALID_RANGE(0, UINT_MAX), DEFAULT(UINT_MAX), BLOCK_SIZE(1)
+);
+
+static Sys_var_enum Sys_threadpool_high_prio_mode(
+  "thread_pool_high_prio_mode",
+  "High priority queue mode: one of 'transactions', 'statements' or 'none'. "
+  "In the 'transactions' mode the thread pool uses both high- and low-priority "
+  "queues depending on whether an event is generated by an already started "
+  "transaction or a connection holding a MDL, table, user, or a global read "
+  "or backup lock and whether it has any high priority tickets (see "
+  "thread_pool_high_prio_tickets). In the 'statements' mode all events (i.e. "
+  "individual statements) always go to the high priority queue, regardless of "
+  "the current transaction and lock state and high priority tickets. "
+  "'none' is the opposite of 'statements', i.e. disables the high priority queue "
+  "completely.",
+  SESSION_VAR(threadpool_high_prio_mode), CMD_LINE(REQUIRED_ARG),
+  threadpool_high_prio_mode_names, DEFAULT(TP_HIGH_PRIO_MODE_TRANSACTIONS));
+
+#endif /* !WIN32 */
+static Sys_var_uint Sys_threadpool_max_threads(
+  "thread_pool_max_threads",
+  "Maximum allowed number of worker threads in the thread pool",
+   GLOBAL_VAR(threadpool_max_threads), CMD_LINE(REQUIRED_ARG),
+   VALID_RANGE(1, MAX_CONNECTIONS), DEFAULT(MAX_CONNECTIONS), BLOCK_SIZE(1),
+   NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+   ON_UPDATE(fix_tp_max_threads)
+);
+#endif /* HAVE_POOL_OF_THREADS */
 
 /**
   Function to check if the 'next' transaction isolation level
@@ -4516,7 +4654,7 @@ static Sys_var_bit Sys_log_off(
        DEFAULT(FALSE), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_has_super));
 
 /**
-  This function sets the session variable thd->variables.sql_log_bin 
+  This function sets the session variable thd->variables.sql_log_bin
   to reflect changes to @@session.sql_log_bin.
 
   @param[in] self   A pointer to the sys_var, i.e. Sys_log_binlog.
@@ -4695,7 +4833,7 @@ static Sys_var_session_special_double Sys_timestamp(
        "timestamp", "Set the time for this client",
        sys_var::ONLY_SESSION, NO_CMD_LINE,
        VALID_RANGE(0, 0), BLOCK_SIZE(1),
-       NO_MUTEX_GUARD, IN_BINLOG, ON_CHECK(check_timestamp), 
+       NO_MUTEX_GUARD, IN_BINLOG, ON_CHECK(check_timestamp),
        ON_UPDATE(update_timestamp), ON_READ(read_timestamp));
 
 static bool update_last_insert_id(THD *thd, set_var *var)
@@ -4930,10 +5068,10 @@ static bool check_log_path(sys_var *self, THD *thd, set_var *var)
   if (!path_length)
     return true;
 
-  if (!is_filename_allowed(var->save_result.string_value.str, 
+  if (!is_filename_allowed(var->save_result.string_value.str,
                            var->save_result.string_value.length, TRUE))
   {
-     my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), 
+     my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0),
               self->name.str, var->save_result.string_value.str);
      return true;
   }
@@ -5475,7 +5613,7 @@ static Sys_var_uint Sys_host_cache_size(
 static Sys_var_charptr Sys_ignore_db_dirs(
        "ignore_db_dirs",
        "The list of directories to ignore when collecting database lists",
-       READ_ONLY GLOBAL_VAR(opt_ignore_db_dirs), 
+       READ_ONLY GLOBAL_VAR(opt_ignore_db_dirs),
        NO_CMD_LINE,
        IN_FS_CHARSET, DEFAULT(0));
 
@@ -5779,7 +5917,7 @@ static Sys_var_mybool Sys_disconnect_on_expired_password(
        READ_ONLY GLOBAL_VAR(disconnect_on_expired_password),
        CMD_LINE(OPT_ARG), DEFAULT(TRUE));
 
-#ifndef NO_EMBEDDED_ACCESS_CHECKS 
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
 static Sys_var_mybool Sys_validate_user_plugins(
        "validate_user_plugins",
        "Turns on additional validation of authentication plugins assigned "
